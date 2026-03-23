@@ -13,6 +13,15 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
+      - name: Debug connectivity
+        run: |
+          echo "Testing mainDBI endpoint..."
+          curl -4 -v --connect-timeout 20 \
+            'https://jarvekyla.edupage.org/rpr/server/maindbi.js?__func=mainDBIAccessor' || true
+
+          echo "Testing holidays page..."
+          curl -4 -I https://jarvekyla.edu.ee/vaheajad/ || true
+
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
@@ -21,7 +30,7 @@ jobs:
       - name: Install dependencies
         run: pip install requests
 
-      - name: Generate ICS
+      - name: Run script
         run: python generate_ics.py
 
       - name: Commit updated ICS
