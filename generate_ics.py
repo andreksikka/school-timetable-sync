@@ -10,7 +10,7 @@ from urllib.request import urlopen, Request
 BASE_URL = "https://jarvekyla.edupage.org"
 CLASS_SHORT = "3b"
 TIMEZONE = "Europe/Tallinn"
-CALENDAR_NAME = "3b tunniplaan"
+CALENDAR_NAME = "Saskia tunniplaan"
 OUTPUT_FILE = "3b.ics"
 
 # Inclusive date ranges for event generation.
