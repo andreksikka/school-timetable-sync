@@ -1,16 +1,19 @@
 #!/usr/bin/env python3
 from __future__ import annotations
 
-import json
 import hashlib
+import json
+import socket
+import ssl
 from datetime import date, datetime, timedelta
 from pathlib import Path
-from urllib.request import urlopen, Request
+from urllib.parse import urlencode
+from urllib.request import Request, urlopen
 
 BASE_URL = "https://jarvekyla.edupage.org"
 CLASS_SHORT = "3b"
 TIMEZONE = "Europe/Tallinn"
-CALENDAR_NAME = "Saskia tunniplaan"
+CALENDAR_NAME = "3b tunniplaan"
 OUTPUT_FILE = "3b.ics"
 
 # Inclusive date ranges for event generation.
@@ -22,13 +25,49 @@ DATE_RANGES = [
 # Optional extra exclusions. Keep empty if not needed.
 EXCLUDED_DATES: set[str] = set()
 
-USER_AGENT = "Mozilla/5.0 (compatible; timetable-sync/1.0)"
+USER_AGENT = "Mozilla/5.0 (compatible; timetable-sync/1.1)"
 
 
-def fetch_json(path: str) -> dict:
-    req = Request(BASE_URL + path, headers={"User-Agent": USER_AGENT})
-    with urlopen(req, timeout=30) as resp:
-        return json.loads(resp.read().decode("utf-8"))
+def fetch_json(path: str, params: dict | None = None) -> dict:
+    url = BASE_URL + path
+    if params:
+        sep = "&" if "?" in url else "?"
+        url += sep + urlencode(params)
+
+    req = Request(
+        url,
+        headers={
+            "User-Agent": USER_AGENT,
+            "Accept": "application/json,text/javascript,*/*;q=0.1",
+            "Referer": f"{BASE_URL}/timetable/",
+        },
+    )
+
+    original_getaddrinfo = socket.getaddrinfo
+
+    def ipv4_only_getaddrinfo(host, port, family=0, type=0, proto=0, flags=0):
+        return original_getaddrinfo(host, port, socket.AF_INET, type, proto, flags)
+
+    try:
+        socket.getaddrinfo = ipv4_only_getaddrinfo
+        with urlopen(req, timeout=30, context=ssl.create_default_context()) as resp:
+            raw = resp.read().decode("utf-8")
+    finally:
+        socket.getaddrinfo = original_getaddrinfo
+
+    raw = raw.strip()
+
+    try:
+        return json.loads(raw)
+    except json.JSONDecodeError:
+        # Fallback for responses wrapped in a JS callback or similar.
+        start = raw.find("(")
+        end = raw.rfind(")")
+        if start != -1 and end != -1 and end > start:
+            inner = raw[start + 1 : end].strip()
+            return json.loads(inner)
+
+    raise ValueError(f"Unexpected response format from {url}: {raw[:300]}")
 
 
 def table_map(data: dict) -> dict[str, dict]:
@@ -62,8 +101,10 @@ def fold_ics_line(line: str) -> str:
     encoded = line.encode("utf-8")
     if len(encoded) <= 75:
         return line
-    out = []
+
+    out: list[str] = []
     current = b""
+
     for ch in line:
         b = ch.encode("utf-8")
         if len(current) + len(b) > 73:
@@ -71,8 +112,10 @@ def fold_ics_line(line: str) -> str:
             current = b" " + b
         else:
             current += b
+
     if current:
         out.append(current.decode("utf-8"))
+
     return "\r\n".join(out)
 
 
@@ -101,7 +144,7 @@ def choose_best_lesson(entries: list[dict], class_short: str) -> dict:
         has_group = 1 if group_text.strip() else 0
 
         # Stable fallback to deterministic ordering.
-        stable = f"{entry.get('subject_name','')}|{teacher_text}|{group_text}"
+        stable = f"{entry.get('subject_name', '')}|{teacher_text}|{group_text}"
         return (explicit_match, has_group, stable)
 
     return sorted(entries, key=score, reverse=True)[0]
@@ -111,11 +154,13 @@ def build_events() -> list[dict]:
     viewer = fetch_json("/timetable/server/ttviewer.js?__func=getTTViewerData")
     tt_num = viewer["r"]["regular"]["default_num"]
 
-    data = fetch_json("/timetable/server/regulartt.js?__func=regularttGetData")
+    data = fetch_json(
+        "/timetable/server/regulartt.js?__func=regularttGetData",
+        params={"tt_num": tt_num},
+    )
     tables = table_map(data)
 
     periods = row_index(tables["periods"])
-    days = row_index(tables["days"])
     classes = row_index(tables["classes"])
     subjects = row_index(tables["subjects"])
     teachers = row_index(tables["teachers"])
@@ -189,19 +234,28 @@ def build_events() -> list[dict]:
     for start_s, end_s in DATE_RANGES:
         start_d = parse_date(start_s)
         end_d = parse_date(end_s)
+
         for current in daterange(start_d, end_d):
             if current.isoformat() in EXCLUDED_DATES:
                 continue
+
             weekday = current.weekday()  # Monday = 0
             same_day_items = []
+
             for (day_index, period_id), entry in selected_pattern.items():
                 if day_index != weekday:
                     continue
                 same_day_items.append((int(period_id), entry))
 
             for _, entry in sorted(same_day_items, key=lambda x: x[0]):
-                start_dt = datetime.strptime(f"{current.isoformat()} {entry['starttime']}", "%Y-%m-%d %H:%M")
-                end_dt = datetime.strptime(f"{current.isoformat()} {entry['endtime']}", "%Y-%m-%d %H:%M")
+                start_dt = datetime.strptime(
+                    f"{current.isoformat()} {entry['starttime']}",
+                    "%Y-%m-%d %H:%M",
+                )
+                end_dt = datetime.strptime(
+                    f"{current.isoformat()} {entry['endtime']}",
+                    "%Y-%m-%d %H:%M",
+                )
                 duration_min = int((end_dt - start_dt).total_seconds() // 60)
 
                 description_lines = [
@@ -214,7 +268,9 @@ def build_events() -> list[dict]:
                 if entry["room_names"]:
                     description_lines.append(f"Ruum: {', '.join(entry['room_names'])}")
                 if any(name.strip() for name in entry["groupnames"]):
-                    description_lines.append(f"Grupp: {', '.join([g for g in entry['groupnames'] if g.strip()])}")
+                    description_lines.append(
+                        f"Grupp: {', '.join([g for g in entry['groupnames'] if g.strip()])}"
+                    )
 
                 uid_seed = f"{CLASS_SHORT}|{current.isoformat()}|{entry['starttime']}|{entry['subject_name']}"
                 uid = hashlib.sha1(uid_seed.encode("utf-8")).hexdigest() + "@jarvekyla-edupage"
@@ -260,7 +316,10 @@ def write_ics(events: list[dict], output_path: Path) -> None:
         )
 
     lines.append("END:VCALENDAR")
-    output_path.write_text("\r\n".join(fold_ics_line(line) for line in lines) + "\r\n", encoding="utf-8")
+    output_path.write_text(
+        "\r\n".join(fold_ics_line(line) for line in lines) + "\r\n",
+        encoding="utf-8",
+    )
 
 
 def main() -> None:
