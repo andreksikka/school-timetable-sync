@@ -7,7 +7,6 @@ import re
 import subprocess
 from datetime import date, datetime, timedelta
 from pathlib import Path
-from urllib.parse import urlencode
 
 BASE_URL = "https://jarvekyla.edupage.org"
 HOLIDAYS_URL = "https://jarvekyla.edu.ee/vaheajad/"
@@ -16,10 +15,9 @@ TIMEZONE = "Europe/Tallinn"
 CALENDAR_NAME = "3b tunniplaan"
 OUTPUT_FILE = "3b.ics"
 
-# Optional manual exclusions in addition to school holidays.
 EXCLUDED_DATES: set[str] = set()
 
-USER_AGENT = "Mozilla/5.0 (compatible; timetable-sync/1.4)"
+USER_AGENT = "Mozilla/5.0 (compatible; timetable-sync/2.0)"
 
 ESTONIAN_MONTHS = {
     "jaanuar": 1,
@@ -39,11 +37,7 @@ ESTONIAN_MONTHS = {
 
 def get_global_range() -> tuple[str, str]:
     today = date.today()
-
-    # Jan-Jun -> current year
-    # Jul-Dec -> next year
     year = today.year if today.month <= 6 else today.year + 1
-
     return (f"{year}-03-01", f"{year}-06-05")
 
 
@@ -82,13 +76,46 @@ def fetch_text(url: str, referer: str | None = None) -> str:
     return result.stdout
 
 
-def fetch_json(path: str, params: dict | None = None) -> dict:
-    url = BASE_URL + path
-    if params:
-        sep = "&" if "?" in url else "?"
-        url += sep + urlencode(params)
+def fetch_post_json(url: str, form_fields: list[tuple[str, str]], referer: str | None = None) -> dict:
+    cmd = [
+        "curl",
+        "-4",
+        "--silent",
+        "--show-error",
+        "--location",
+        "--connect-timeout",
+        "20",
+        "--max-time",
+        "90",
+        "--retry",
+        "3",
+        "--retry-delay",
+        "2",
+        "--user-agent",
+        USER_AGENT,
+        "--header",
+        "Accept: application/json,text/javascript,*/*;q=0.1",
+        "--request",
+        "POST",
+    ]
+    if referer:
+        cmd.extend(["--referer", referer])
 
-    raw = fetch_text(url, referer=f"{BASE_URL}/timetable/").strip()
+    for key, value in form_fields:
+        cmd.extend(["--data-urlencode", f"{key}={value}"])
+
+    cmd.append(url)
+
+    result = subprocess.run(cmd, capture_output=True, text=True)
+    if result.returncode != 0:
+        raise RuntimeError(
+            f"curl POST failed for {url}\n"
+            f"exit={result.returncode}\n"
+            f"stdout={result.stdout[:500]}\n"
+            f"stderr={result.stderr[:1500]}"
+        )
+
+    raw = result.stdout.strip()
 
     try:
         return json.loads(raw)
@@ -96,19 +123,9 @@ def fetch_json(path: str, params: dict | None = None) -> dict:
         start = raw.find("(")
         end = raw.rfind(")")
         if start != -1 and end != -1 and end > start:
-            inner = raw[start + 1 : end].strip()
-            return json.loads(inner)
+            return json.loads(raw[start + 1:end].strip())
 
-    raise ValueError(f"Unexpected response format from {url}: {raw[:500]}")
-
-
-def table_map(data: dict) -> dict[str, dict]:
-    tables = data["r"]["dbiAccessorRes"]["tables"]
-    return {table["id"]: table for table in tables}
-
-
-def row_index(table: dict) -> dict[str, dict]:
-    return {row["id"]: row for row in table.get("data_rows", [])}
+    raise ValueError(f"Unexpected JSON response from {url}: {raw[:500]}")
 
 
 def parse_date(value: str) -> date:
@@ -120,6 +137,16 @@ def daterange(start: date, end: date):
     while current <= end:
         yield current
         current += timedelta(days=1)
+
+
+def week_ranges(start: date, end: date) -> list[tuple[date, date]]:
+    ranges = []
+    current = start
+    while current <= end:
+        week_end = min(current + timedelta(days=6), end)
+        ranges.append((current, week_end))
+        current = week_end + timedelta(days=1)
+    return ranges
 
 
 def ics_escape(value: str) -> str:
@@ -159,26 +186,6 @@ def normalize_subject(name: str) -> str:
         "Klassijuhataja": "Klassijuhataja tund",
     }
     return replacements.get(name, name)
-
-
-def choose_best_lesson(entries: list[dict], class_short: str) -> dict:
-    class_short = class_short.lower()
-
-    def score(entry: dict) -> tuple[int, int, str]:
-        group_text = " ".join(entry.get("groupnames", [])).lower()
-        teacher_text = " ".join(entry.get("teacher_names", [])).lower()
-        subject_text = entry.get("subject_name", "").lower()
-
-        # Prefer explicit 3b match in group/subject text
-        explicit_match = 1 if class_short in group_text or class_short in subject_text else 0
-
-        # Prefer entries with some group label over empty
-        has_group = 1 if group_text.strip() else 0
-
-        stable = f"{entry.get('subject_name', '')}|{teacher_text}|{group_text}"
-        return (explicit_match, has_group, stable)
-
-    return sorted(entries, key=score, reverse=True)[0]
 
 
 def infer_school_year_start(global_start: date) -> int:
@@ -244,12 +251,87 @@ def fetch_holiday_ranges(global_start: date, global_end: date) -> list[tuple[dat
 
 def build_excluded_dates(global_start: date, global_end: date) -> set[str]:
     excluded = set(EXCLUDED_DATES)
-
     for holiday_start, holiday_end in fetch_holiday_ranges(global_start, global_end):
         for d in daterange(holiday_start, holiday_end):
             excluded.add(d.isoformat())
-
     return excluded
+
+
+def get_needed_part() -> dict:
+    return {
+        "teachers": ["short", "name", "firstname", "lastname", "callname", "subname", "code", "cb_hidden", "expired"],
+        "classes": ["short", "name", "firstname", "lastname", "callname", "subname", "code", "classroomid"],
+        "classrooms": ["short", "name", "firstname", "lastname", "callname", "subname", "code"],
+        "igroups": ["short", "name", "firstname", "lastname", "callname", "subname", "code"],
+        "students": ["short", "name", "firstname", "lastname", "callname", "subname", "code", "classid"],
+        "subjects": ["short", "name", "firstname", "lastname", "callname", "subname", "code"],
+        "events": ["typ", "name"],
+        "event_types": ["name", "icon"],
+        "subst_absents": ["date", "absent_typeid", "groupname"],
+        "periods": ["short", "name", "firstname", "lastname", "callname", "subname", "code", "period", "starttime", "endtime"],
+        "dayparts": ["starttime", "endtime"],
+        "dates": ["tt_num", "tt_day"],
+    }
+
+
+def fetch_week_data(week_start: date, week_end: date, school_year_start: int) -> dict:
+    url = f"{BASE_URL}/rpr/server/maindbi.js?__func=mainDBIAccessor"
+    payload = {
+        "__args": [
+            None,
+            school_year_start,
+            {
+                "vt_filter": {
+                    "datefrom": week_start.isoformat(),
+                    "dateto": week_end.isoformat(),
+                }
+            },
+            {
+                "op": "fetch",
+                "needed_part": get_needed_part(),
+                "needed_combos": {},
+            },
+        ],
+        "__gsh": "00000000",
+    }
+
+    return fetch_post_json(
+        url,
+        [
+            ("__func", "mainDBIAccessor"),
+            ("__args", json.dumps(payload["__args"], ensure_ascii=False, separators=(",", ":"))),
+            ("__gsh", payload["__gsh"]),
+        ],
+        referer=f"{BASE_URL}/timetable/",
+    )
+
+
+def find_table(data: dict, table_name: str) -> list[dict]:
+    container = data.get("r", {}).get("dbiAccessorRes", {})
+    tables = container.get("tables", [])
+    for table in tables:
+        if table.get("id") == table_name:
+            return table.get("data_rows", [])
+    return []
+
+
+def row_index(rows: list[dict]) -> dict[str, dict]:
+    return {row["id"]: row for row in rows if "id" in row}
+
+
+def choose_best_entry(entries: list[dict], class_short: str) -> dict:
+    class_short = class_short.lower()
+
+    def score(entry: dict) -> tuple[int, int, str]:
+        group_text = " ".join(entry.get("groupnames", [])).lower()
+        teacher_text = " ".join(entry.get("teacher_names", [])).lower()
+        subject_text = entry.get("subject_name", "").lower()
+        explicit_match = 1 if class_short in group_text or class_short in subject_text else 0
+        has_group = 1 if group_text.strip() else 0
+        stable = f"{entry.get('subject_name', '')}|{teacher_text}|{group_text}"
+        return (explicit_match, has_group, stable)
+
+    return sorted(entries, key=score, reverse=True)[0]
 
 
 def build_events() -> list[dict]:
@@ -257,100 +339,89 @@ def build_events() -> list[dict]:
     global_start = parse_date(global_range[0])
     global_end = parse_date(global_range[1])
     excluded_dates = build_excluded_dates(global_start, global_end)
+    school_year_start = infer_school_year_start(global_start)
 
-    viewer = fetch_json("/timetable/server/ttviewer.js?__func=getTTViewerData")
-    tt_num = viewer["r"]["regular"]["default_num"]
+    all_events: list[dict] = []
 
-    data = fetch_json(
-        "/timetable/server/regulartt.js?__func=regularttGetData",
-        params={"tt_num": tt_num},
-    )
-    tables = table_map(data)
+    for week_start, week_end in week_ranges(global_start, global_end):
+        week_data = fetch_week_data(week_start, week_end, school_year_start)
 
-    periods = row_index(tables["periods"])
-    classes = row_index(tables["classes"])
-    subjects = row_index(tables["subjects"])
-    teachers = row_index(tables["teachers"])
-    classrooms = row_index(tables["classrooms"])
-    lessons = row_index(tables["lessons"])
-    cards = tables["cards"]["data_rows"]
+        classes = row_index(find_table(week_data, "classes"))
+        subjects = row_index(find_table(week_data, "subjects"))
+        teachers = row_index(find_table(week_data, "teachers"))
+        classrooms = row_index(find_table(week_data, "classrooms"))
+        periods = row_index(find_table(week_data, "periods"))
+        dates = find_table(week_data, "dates")
 
-    class_row = next((row for row in classes.values() if row.get("short") == CLASS_SHORT), None)
-    if not class_row:
-        raise RuntimeError(f"Class {CLASS_SHORT!r} not found in timetable data")
-
-    class_id = class_row["id"]
-
-    weekday_map = {
-        "0": 0,  # Monday
-        "1": 1,
-        "2": 2,
-        "3": 3,
-        "4": 4,
-    }
-
-    pattern_entries: dict[tuple[int, str], list[dict]] = {}
-
-    for card in cards:
-        lesson = lessons.get(card["lessonid"])
-        if not lesson or class_id not in lesson.get("classids", []):
+        class_row = next((row for row in classes.values() if row.get("short") == CLASS_SHORT), None)
+        if not class_row:
             continue
 
-        period = periods.get(card["period"])
-        if not period:
+        class_id = class_row["id"]
+
+        tt_num_by_day: dict[str, str] = {}
+        for d in dates:
+            if "tt_day" in d and "tt_num" in d:
+                tt_num_by_day[d["tt_day"]] = str(d["tt_num"])
+
+        cards = find_table(week_data, "cards")
+        lessons = row_index(find_table(week_data, "lessons"))
+
+        if not cards or not lessons:
             continue
 
-        subject = subjects.get(lesson["subjectid"], {})
-        subject_name = normalize_subject(subject.get("name", "Tund"))
+        by_day_period: dict[tuple[str, str], list[dict]] = {}
 
-        teacher_names = []
-        for teacher_id in lesson.get("teacherids", []):
-            teacher = teachers.get(teacher_id)
-            if teacher:
-                teacher_names.append(teacher.get("short", teacher_id))
-
-        room_names = []
-        for room_id in card.get("classroomids", []):
-            room = classrooms.get(room_id)
-            if room:
-                room_names.append(room.get("short", room_id))
-
-        entry = {
-            "subject_name": subject_name,
-            "subject_short": subject.get("short", ""),
-            "teacher_names": teacher_names,
-            "room_names": room_names,
-            "groupnames": lesson.get("groupnames", []),
-            "period": card["period"],
-            "starttime": period["starttime"],
-            "endtime": period["endtime"],
-            "durationperiods": int(lesson.get("durationperiods", 1) or 1),
-            "tt_num": tt_num,
-        }
-
-        for idx, flag in enumerate(card.get("days", "")):
-            if flag == "1" and str(idx) in weekday_map:
-                key = (weekday_map[str(idx)], card["period"])
-                pattern_entries.setdefault(key, []).append(entry)
-
-    selected_pattern: dict[tuple[int, str], dict] = {}
-    for key, entries in pattern_entries.items():
-        selected_pattern[key] = choose_best_lesson(entries, CLASS_SHORT)
-
-    all_events = []
-    for current in daterange(global_start, global_end):
-        if current.isoformat() in excluded_dates:
-            continue
-
-        weekday = current.weekday()
-        same_day_items = []
-
-        for (day_index, period_id), entry in selected_pattern.items():
-            if day_index != weekday:
+        for card in cards:
+            lesson = lessons.get(card.get("lessonid", ""))
+            if not lesson:
                 continue
-            same_day_items.append((int(period_id), entry))
 
-        for _, entry in sorted(same_day_items, key=lambda x: x[0]):
+            if class_id not in lesson.get("classids", []):
+                continue
+
+            period = periods.get(card.get("period", ""))
+            if not period:
+                continue
+
+            subject = subjects.get(lesson.get("subjectid", ""), {})
+            subject_name = normalize_subject(subject.get("name", "Tund"))
+
+            teacher_names = []
+            for teacher_id in lesson.get("teacherids", []):
+                teacher = teachers.get(teacher_id)
+                if teacher:
+                    teacher_names.append(teacher.get("short", teacher_id))
+
+            room_names = []
+            for room_id in card.get("classroomids", []):
+                room = classrooms.get(room_id)
+                if room:
+                    room_names.append(room.get("short", room_id))
+
+            for tt_day in card.get("dateids", []):
+                key = (tt_day, card["period"])
+                by_day_period.setdefault(key, []).append(
+                    {
+                        "subject_name": subject_name,
+                        "teacher_names": teacher_names,
+                        "room_names": room_names,
+                        "groupnames": lesson.get("groupnames", []),
+                        "starttime": period["starttime"],
+                        "endtime": period["endtime"],
+                        "tt_day": tt_day,
+                    }
+                )
+
+        for (tt_day, period_id), entries in by_day_period.items():
+            current = parse_date(tt_day)
+            if current < global_start or current > global_end:
+                continue
+            if current.isoformat() in excluded_dates:
+                continue
+
+            entry = choose_best_entry(entries, CLASS_SHORT)
+
             start_dt = datetime.strptime(
                 f"{current.isoformat()} {entry['starttime']}",
                 "%Y-%m-%d %H:%M",
@@ -364,8 +435,12 @@ def build_events() -> list[dict]:
             description_lines = [
                 f"Klass: {CLASS_SHORT}",
                 f"Kestus: {duration_min} min",
-                f"Tunniplaan: {entry['tt_num']}",
             ]
+
+            tt_num = tt_num_by_day.get(tt_day)
+            if tt_num:
+                description_lines.append(f"Tunniplaan: {tt_num}")
+
             if entry["teacher_names"]:
                 description_lines.append(f"Õpetaja: {', '.join(entry['teacher_names'])}")
             if entry["room_names"]:
@@ -397,7 +472,7 @@ def write_ics(events: list[dict], output_path: Path) -> None:
     lines = [
         "BEGIN:VCALENDAR",
         "VERSION:2.0",
-        "PRODID:-//ChatGPT//Edupage GitHub Sync//EN",
+        "PRODID:-//ChatGPT//Edupage mainDBI Sync//EN",
         "CALSCALE:GREGORIAN",
         "METHOD:PUBLISH",
         "X-WR-CALNAME:" + ics_escape(CALENDAR_NAME),
