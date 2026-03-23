@@ -3,29 +3,83 @@ from __future__ import annotations
 
 import hashlib
 import json
-import socket
-import ssl
+import re
+import subprocess
 from datetime import date, datetime, timedelta
 from pathlib import Path
 from urllib.parse import urlencode
-from urllib.request import Request, urlopen
 
 BASE_URL = "https://jarvekyla.edupage.org"
+HOLIDAYS_URL = "https://jarvekyla.edu.ee/vaheajad/"
 CLASS_SHORT = "3b"
 TIMEZONE = "Europe/Tallinn"
 CALENDAR_NAME = "3b tunniplaan"
 OUTPUT_FILE = "3b.ics"
 
-# Inclusive date ranges for event generation.
-DATE_RANGES = [
-    ("2026-03-01", "2026-04-12"),
-    ("2026-04-20", "2026-06-05"),
-]
-
-# Optional extra exclusions. Keep empty if not needed.
+# Optional manual exclusions in addition to school holidays.
 EXCLUDED_DATES: set[str] = set()
 
-USER_AGENT = "Mozilla/5.0 (compatible; timetable-sync/1.1)"
+USER_AGENT = "Mozilla/5.0 (compatible; timetable-sync/1.4)"
+
+ESTONIAN_MONTHS = {
+    "jaanuar": 1,
+    "veebruar": 2,
+    "märts": 3,
+    "aprill": 4,
+    "mai": 5,
+    "juuni": 6,
+    "juuli": 7,
+    "august": 8,
+    "september": 9,
+    "oktoober": 10,
+    "november": 11,
+    "detsember": 12,
+}
+
+
+def get_global_range() -> tuple[str, str]:
+    today = date.today()
+
+    # Jan-Jun -> current year
+    # Jul-Dec -> next year
+    year = today.year if today.month <= 6 else today.year + 1
+
+    return (f"{year}-03-01", f"{year}-06-05")
+
+
+def fetch_text(url: str, referer: str | None = None) -> str:
+    cmd = [
+        "curl",
+        "-4",
+        "--silent",
+        "--show-error",
+        "--location",
+        "--connect-timeout",
+        "20",
+        "--max-time",
+        "90",
+        "--retry",
+        "3",
+        "--retry-delay",
+        "2",
+        "--user-agent",
+        USER_AGENT,
+        "--header",
+        "Accept: text/html,application/json,text/javascript,*/*;q=0.1",
+    ]
+    if referer:
+        cmd.extend(["--referer", referer])
+    cmd.append(url)
+
+    result = subprocess.run(cmd, capture_output=True, text=True)
+    if result.returncode != 0:
+        raise RuntimeError(
+            f"curl failed for {url}\n"
+            f"exit={result.returncode}\n"
+            f"stdout={result.stdout[:500]}\n"
+            f"stderr={result.stderr[:1500]}"
+        )
+    return result.stdout
 
 
 def fetch_json(path: str, params: dict | None = None) -> dict:
@@ -34,40 +88,18 @@ def fetch_json(path: str, params: dict | None = None) -> dict:
         sep = "&" if "?" in url else "?"
         url += sep + urlencode(params)
 
-    req = Request(
-        url,
-        headers={
-            "User-Agent": USER_AGENT,
-            "Accept": "application/json,text/javascript,*/*;q=0.1",
-            "Referer": f"{BASE_URL}/timetable/",
-        },
-    )
-
-    original_getaddrinfo = socket.getaddrinfo
-
-    def ipv4_only_getaddrinfo(host, port, family=0, type=0, proto=0, flags=0):
-        return original_getaddrinfo(host, port, socket.AF_INET, type, proto, flags)
-
-    try:
-        socket.getaddrinfo = ipv4_only_getaddrinfo
-        with urlopen(req, timeout=30, context=ssl.create_default_context()) as resp:
-            raw = resp.read().decode("utf-8")
-    finally:
-        socket.getaddrinfo = original_getaddrinfo
-
-    raw = raw.strip()
+    raw = fetch_text(url, referer=f"{BASE_URL}/timetable/").strip()
 
     try:
         return json.loads(raw)
     except json.JSONDecodeError:
-        # Fallback for responses wrapped in a JS callback or similar.
         start = raw.find("(")
         end = raw.rfind(")")
         if start != -1 and end != -1 and end > start:
             inner = raw[start + 1 : end].strip()
             return json.loads(inner)
 
-    raise ValueError(f"Unexpected response format from {url}: {raw[:300]}")
+    raise ValueError(f"Unexpected response format from {url}: {raw[:500]}")
 
 
 def table_map(data: dict) -> dict[str, dict]:
@@ -137,20 +169,95 @@ def choose_best_lesson(entries: list[dict], class_short: str) -> dict:
         teacher_text = " ".join(entry.get("teacher_names", [])).lower()
         subject_text = entry.get("subject_name", "").lower()
 
-        # Prefer explicit 3b match in group name or subject text.
+        # Prefer explicit 3b match in group/subject text
         explicit_match = 1 if class_short in group_text or class_short in subject_text else 0
 
-        # Prefer entries with any group label over blank ones.
+        # Prefer entries with some group label over empty
         has_group = 1 if group_text.strip() else 0
 
-        # Stable fallback to deterministic ordering.
         stable = f"{entry.get('subject_name', '')}|{teacher_text}|{group_text}"
         return (explicit_match, has_group, stable)
 
     return sorted(entries, key=score, reverse=True)[0]
 
 
+def infer_school_year_start(global_start: date) -> int:
+    return global_start.year - 1 if global_start.month < 9 else global_start.year
+
+
+def parse_holiday_date(day_str: str, month_name: str, school_year_start: int) -> date:
+    month = ESTONIAN_MONTHS[month_name.lower()]
+    year = school_year_start if month >= 9 else school_year_start + 1
+    return date(year, month, int(day_str))
+
+
+def fetch_holiday_ranges(global_start: date, global_end: date) -> list[tuple[date, date]]:
+    html = fetch_text(HOLIDAYS_URL, referer=HOLIDAYS_URL)
+    school_year_start = infer_school_year_start(global_start)
+
+    section_match = re.search(
+        r"Koolivaheajad(.*?)(?:</section>|</main>|</article>|$)",
+        html,
+        flags=re.IGNORECASE | re.DOTALL,
+    )
+    source_text = section_match.group(1) if section_match else html
+
+    holiday_pattern = re.compile(
+        r"([IVX]+)\s+vaheaeg.*?"
+        r"(\d{1,2})\.\s*([A-Za-zÕÄÖÜõäöüŠšŽž]+)"
+        r"(?:\s+(\d{4}))?\s*[–-]\s*"
+        r"(\d{1,2})\.\s*([A-Za-zÕÄÖÜõäöüŠšŽž]+)"
+        r"(?:\s+(\d{4}))?",
+        flags=re.IGNORECASE | re.DOTALL,
+    )
+
+    ranges: list[tuple[date, date]] = []
+
+    for match in holiday_pattern.finditer(source_text):
+        start_day, start_month, start_year_text, end_day, end_month, end_year_text = match.group(2, 3, 4, 5, 6, 7)
+
+        if start_month.lower() not in ESTONIAN_MONTHS or end_month.lower() not in ESTONIAN_MONTHS:
+            continue
+
+        if start_year_text:
+            start_date = date(int(start_year_text), ESTONIAN_MONTHS[start_month.lower()], int(start_day))
+        else:
+            start_date = parse_holiday_date(start_day, start_month, school_year_start)
+
+        if end_year_text:
+            end_date = date(int(end_year_text), ESTONIAN_MONTHS[end_month.lower()], int(end_day))
+        else:
+            end_date = parse_holiday_date(end_day, end_month, school_year_start)
+
+        if end_date < start_date:
+            continue
+
+        if end_date < global_start or start_date > global_end:
+            continue
+
+        clipped_start = max(start_date, global_start)
+        clipped_end = min(end_date, global_end)
+        ranges.append((clipped_start, clipped_end))
+
+    return ranges
+
+
+def build_excluded_dates(global_start: date, global_end: date) -> set[str]:
+    excluded = set(EXCLUDED_DATES)
+
+    for holiday_start, holiday_end in fetch_holiday_ranges(global_start, global_end):
+        for d in daterange(holiday_start, holiday_end):
+            excluded.add(d.isoformat())
+
+    return excluded
+
+
 def build_events() -> list[dict]:
+    global_range = get_global_range()
+    global_start = parse_date(global_range[0])
+    global_end = parse_date(global_range[1])
+    excluded_dates = build_excluded_dates(global_start, global_end)
+
     viewer = fetch_json("/timetable/server/ttviewer.js?__func=getTTViewerData")
     tt_num = viewer["r"]["regular"]["default_num"]
 
@@ -175,7 +282,7 @@ def build_events() -> list[dict]:
     class_id = class_row["id"]
 
     weekday_map = {
-        "0": 0,
+        "0": 0,  # Monday
         "1": 1,
         "2": 2,
         "3": 3,
@@ -231,59 +338,55 @@ def build_events() -> list[dict]:
         selected_pattern[key] = choose_best_lesson(entries, CLASS_SHORT)
 
     all_events = []
-    for start_s, end_s in DATE_RANGES:
-        start_d = parse_date(start_s)
-        end_d = parse_date(end_s)
+    for current in daterange(global_start, global_end):
+        if current.isoformat() in excluded_dates:
+            continue
 
-        for current in daterange(start_d, end_d):
-            if current.isoformat() in EXCLUDED_DATES:
+        weekday = current.weekday()
+        same_day_items = []
+
+        for (day_index, period_id), entry in selected_pattern.items():
+            if day_index != weekday:
                 continue
+            same_day_items.append((int(period_id), entry))
 
-            weekday = current.weekday()  # Monday = 0
-            same_day_items = []
+        for _, entry in sorted(same_day_items, key=lambda x: x[0]):
+            start_dt = datetime.strptime(
+                f"{current.isoformat()} {entry['starttime']}",
+                "%Y-%m-%d %H:%M",
+            )
+            end_dt = datetime.strptime(
+                f"{current.isoformat()} {entry['endtime']}",
+                "%Y-%m-%d %H:%M",
+            )
+            duration_min = int((end_dt - start_dt).total_seconds() // 60)
 
-            for (day_index, period_id), entry in selected_pattern.items():
-                if day_index != weekday:
-                    continue
-                same_day_items.append((int(period_id), entry))
-
-            for _, entry in sorted(same_day_items, key=lambda x: x[0]):
-                start_dt = datetime.strptime(
-                    f"{current.isoformat()} {entry['starttime']}",
-                    "%Y-%m-%d %H:%M",
+            description_lines = [
+                f"Klass: {CLASS_SHORT}",
+                f"Kestus: {duration_min} min",
+                f"Tunniplaan: {entry['tt_num']}",
+            ]
+            if entry["teacher_names"]:
+                description_lines.append(f"Õpetaja: {', '.join(entry['teacher_names'])}")
+            if entry["room_names"]:
+                description_lines.append(f"Ruum: {', '.join(entry['room_names'])}")
+            if any(name.strip() for name in entry["groupnames"]):
+                description_lines.append(
+                    f"Grupp: {', '.join([g for g in entry['groupnames'] if g.strip()])}"
                 )
-                end_dt = datetime.strptime(
-                    f"{current.isoformat()} {entry['endtime']}",
-                    "%Y-%m-%d %H:%M",
-                )
-                duration_min = int((end_dt - start_dt).total_seconds() // 60)
 
-                description_lines = [
-                    f"Klass: {CLASS_SHORT}",
-                    f"Kestus: {duration_min} min",
-                    f"Tunniplaan: {entry['tt_num']}",
-                ]
-                if entry["teacher_names"]:
-                    description_lines.append(f"Õpetaja: {', '.join(entry['teacher_names'])}")
-                if entry["room_names"]:
-                    description_lines.append(f"Ruum: {', '.join(entry['room_names'])}")
-                if any(name.strip() for name in entry["groupnames"]):
-                    description_lines.append(
-                        f"Grupp: {', '.join([g for g in entry['groupnames'] if g.strip()])}"
-                    )
+            uid_seed = f"{CLASS_SHORT}|{current.isoformat()}|{entry['starttime']}|{entry['subject_name']}"
+            uid = hashlib.sha1(uid_seed.encode("utf-8")).hexdigest() + "@jarvekyla-edupage"
 
-                uid_seed = f"{CLASS_SHORT}|{current.isoformat()}|{entry['starttime']}|{entry['subject_name']}"
-                uid = hashlib.sha1(uid_seed.encode("utf-8")).hexdigest() + "@jarvekyla-edupage"
-
-                all_events.append(
-                    {
-                        "uid": uid,
-                        "summary": entry["subject_name"],
-                        "start": start_dt,
-                        "end": end_dt,
-                        "description": "\n".join(description_lines),
-                    }
-                )
+            all_events.append(
+                {
+                    "uid": uid,
+                    "summary": entry["subject_name"],
+                    "start": start_dt,
+                    "end": end_dt,
+                    "description": "\n".join(description_lines),
+                }
+            )
 
     all_events.sort(key=lambda e: e["start"])
     return all_events
@@ -327,6 +430,7 @@ def main() -> None:
     events = build_events()
     write_ics(events, output_path)
     print(f"Wrote {len(events)} events to {output_path}")
+    print(f"Global range used: {get_global_range()[0]} -> {get_global_range()[1]}")
 
 
 if __name__ == "__main__":
